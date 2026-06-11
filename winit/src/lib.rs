@@ -64,6 +64,7 @@ use std::borrow::Cow;
 use std::mem::ManuallyDrop;
 use std::slice;
 use std::sync::Arc;
+use winit::event_loop::EventLoop;
 
 /// Runs a [`Program`] with the provided settings.
 pub fn run<P>(program: P) -> Result<(), Error>
@@ -71,15 +72,45 @@ where
     P: Program + 'static,
     P::Theme: theme::Base,
 {
-    use winit::event_loop::EventLoop;
-
-    let boot_span = debug::boot();
-    let settings = program.settings();
-    let window_settings = program.window();
-
     let event_loop = EventLoop::with_user_event()
         .build()
         .expect("Create event loop");
+
+    run_inner(program, event_loop)
+}
+
+/// Runs a [`Program`] with the provided settings.
+#[cfg(target_os = "android")]
+pub fn run_android<P>(
+    program: P,
+    app: winit::platform::android::activity::AndroidApp,
+) -> Result<(), Error>
+where
+    P: Program + 'static,
+    P::Theme: theme::Base,
+{
+    use winit::platform::android::EventLoopBuilderExtAndroid;
+
+    let event_loop = EventLoop::with_user_event()
+        .with_android_app(app)
+        .build()
+        .expect("Create event loop");
+
+    run_inner(program, event_loop)
+}
+
+/// Runs a [`Program`] with the provided settings.
+fn run_inner<P>(
+    program: P,
+    event_loop: EventLoop<Action<<P as Program>::Message>>,
+) -> Result<(), Error>
+where
+    P: Program + 'static,
+    P::Theme: theme::Base,
+{
+    let boot_span = debug::boot();
+    let settings = program.settings();
+    let window_settings = program.window();
 
     let backend_settings = backend::Settings::from(&settings);
     let renderer_settings = renderer::Settings::from(&settings);
@@ -106,16 +137,6 @@ where
     let (program, task) = runtime.enter(|| program::Instance::new(program));
     let is_daemon = window_settings.is_none();
 
-    let task = if let Some(window_settings) = window_settings {
-        let mut task = Some(task);
-
-        let (_id, open) = runtime::window::open(window_settings);
-
-        open.then(move |_| task.take().unwrap_or_else(Task::none))
-    } else {
-        task
-    };
-
     if let Some(stream) = runtime::task::into_stream(task) {
         runtime.run(stream);
     }
@@ -127,6 +148,16 @@ where
     let (event_sender, event_receiver) = mpsc::unbounded();
     let (control_sender, control_receiver) = mpsc::unbounded();
     let (system_theme_sender, system_theme_receiver) = oneshot::channel();
+
+    let create_window_task = if let Some(window_settings) = window_settings {
+        Some(
+            runtime::window::open(window_settings)
+                .1
+                .then(|_| Task::none()),
+        )
+    } else {
+        None
+    };
 
     let instance = Box::pin(run_instance::<P>(
         program,
@@ -140,6 +171,7 @@ where
         renderer_settings,
         settings.fonts,
         system_theme_receiver,
+        create_window_task,
     ));
 
     let context = task::Context::from_waker(task::noop_waker_ref());
@@ -185,6 +217,10 @@ where
                         .unwrap_or_default(),
                 );
             }
+            self.process_event(
+                event_loop,
+                Event::EventLoopAwakened(winit::event::Event::Resumed),
+            );
         }
 
         fn new_events(
@@ -480,6 +516,7 @@ async fn run_instance<P>(
     mut renderer_settings: renderer::Settings,
     default_fonts: Vec<Cow<'static, [u8]>>,
     mut _system_theme: oneshot::Receiver<theme::Mode>,
+    mut create_window_task: Option<Task<P::Message>>,
 ) where
     P: Program + 'static,
     P::Theme: theme::Base,
@@ -1194,6 +1231,35 @@ async fn run_instance<P>(
                         } else {
                             let _ =
                                 control_sender.start_send(Control::ChangeFlow(ControlFlow::Wait));
+                        }
+                    }
+                    event::Event::Resumed => {
+                        if let Some(task) = create_window_task.take() {
+                            if let Some(stream) = runtime::task::into_stream(task) {
+                                runtime.run(stream);
+                            }
+                        }
+
+                        let Some(current_compositor) = compositor.as_mut() else {
+                            continue;
+                        };
+
+                        for (_id, window) in window_manager.iter_mut() {
+                            let physical_size = window.state.physical_size();
+
+                            window.surface = current_compositor.create_surface(
+                                window.raw.clone(),
+                                physical_size.width,
+                                physical_size.height,
+                            );
+
+                            current_compositor.configure_surface(
+                                &mut window.surface,
+                                physical_size.width,
+                                physical_size.height,
+                            );
+
+                            window.raw.request_redraw();
                         }
                     }
                     _ => {}
