@@ -188,6 +188,29 @@ impl<P: Program> Application<P> {
         Self: 'static,
         P::Message: message::MaybeDebug + message::MaybeClone,
     {
+        Ok(shell::run(self.into_program())?)
+    }
+
+    /// Runs the [`Application`] on Android with the given `AndroidApp`.
+    #[cfg(target_os = "android")]
+    pub fn run_android(
+        self,
+        app: shell::winit::platform::android::activity::AndroidApp,
+    ) -> Result
+    where
+        Self: 'static,
+        P::Message: message::MaybeDebug + message::MaybeClone,
+    {
+        Ok(shell::run_android(self.into_program(), app)?)
+    }
+
+    /// Attaches the debug/tester tooling (when enabled) and returns the
+    /// [`Program`] that will actually be run by the shell.
+    fn into_program(self) -> impl Program
+    where
+        Self: 'static,
+        P::Message: message::MaybeDebug + message::MaybeClone,
+    {
         #[cfg(feature = "debug")]
         iced_debug::init(iced_debug::Metadata {
             name: P::name(),
@@ -211,7 +234,7 @@ impl<P: Program> Application<P> {
         )))]
         let program = self;
 
-        Ok(shell::run(program)?)
+        program
     }
 
     /// Sets the [`Settings`] that will be used to run the [`Application`].

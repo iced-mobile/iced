@@ -72,13 +72,49 @@ where
 {
     use winit::event_loop::EventLoop;
 
-    let boot_span = debug::boot();
-    let settings = program.settings();
-    let window_settings = program.window();
-
     let event_loop = EventLoop::with_user_event()
         .build()
         .expect("Create event loop");
+
+    run_with_event_loop(program, event_loop)
+}
+
+/// Runs a [`Program`] on Android with the provided `AndroidApp`.
+///
+/// The surface is (re)created whenever the activity is `Resumed`, which
+/// avoids the black screen that would otherwise appear after the Android
+/// window is destroyed and recreated across the app lifecycle.
+#[cfg(target_os = "android")]
+pub fn run_android<P>(
+    program: P,
+    app: winit::platform::android::activity::AndroidApp,
+) -> Result<(), Error>
+where
+    P: Program + 'static,
+    P::Theme: theme::Base,
+{
+    use winit::event_loop::EventLoop;
+    use winit::platform::android::EventLoopBuilderExtAndroid;
+
+    let event_loop = EventLoop::with_user_event()
+        .with_android_app(app)
+        .build()
+        .expect("Create event loop");
+
+    run_with_event_loop(program, event_loop)
+}
+
+fn run_with_event_loop<P>(
+    program: P,
+    event_loop: winit::event_loop::EventLoop<Action<P::Message>>,
+) -> Result<(), Error>
+where
+    P: Program + 'static,
+    P::Theme: theme::Base,
+{
+    let boot_span = debug::boot();
+    let settings = program.settings();
+    let window_settings = program.window();
 
     let graphics_settings = settings.clone().into();
     let display_handle = event_loop.owned_display_handle();
@@ -184,6 +220,11 @@ where
                         .unwrap_or_default(),
                 );
             }
+
+            self.process_event(
+                event_loop,
+                Event::EventLoopAwakened(winit::event::Event::Resumed),
+            );
         }
 
         fn new_events(
@@ -1263,6 +1304,34 @@ async fn run_instance<P>(
                             let _ = control_sender.start_send(
                                 Control::ChangeFlow(ControlFlow::Wait),
                             );
+                        }
+                    }
+                    event::Event::Resumed => {
+                        // Recreate every window surface on resume. On Android
+                        // the underlying native window is destroyed on suspend
+                        // and a fresh one is handed back on resume, so the old
+                        // surface is stale and must be rebuilt to avoid a black
+                        // screen.
+                        if let Some(current_compositor) = compositor.as_mut() {
+                            for (_id, window) in window_manager.iter_mut() {
+                                let physical_size =
+                                    window.state.physical_size();
+
+                                window.surface = current_compositor
+                                    .create_surface(
+                                        window.raw.clone(),
+                                        physical_size.width,
+                                        physical_size.height,
+                                    );
+
+                                current_compositor.configure_surface(
+                                    &mut window.surface,
+                                    physical_size.width,
+                                    physical_size.height,
+                                );
+
+                                window.raw.request_redraw();
+                            }
                         }
                     }
                     _ => {}
